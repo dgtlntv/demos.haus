@@ -1,0 +1,33 @@
+permanent_demos:
+  - repo_owner: "canonical"
+    repo_name: "lxd-ui"
+    demo_url: "lxd.demos.haus"
+    
+  - repo_owner: "canonical" 
+    repo_name: "maas-ui"
+    demo_url: "maas.demos.haus"
+    
+  - repo_owner: "canonical"
+    repo_name: "juju-dashboard"
+    demo_url: "juju.demos.haus"
+  
+  - repo_owner: "canonical"
+    repo_name: "ams"
+    demo_url: "anbox.demos.haus"
+  
+  - repo_owner: "canonical"
+    repo_name: "landscape-dashboard"
+    demo_url: "landscape.demos.haus"
+  
+  - repo_owner: "canonical"
+    repo_name: "kernelfactory.canonical.com"
+    demo_url: "kernelfactory.demos.haus"
+
+# Don't know how the structure needs to be for launchpad based repos
+#  - repo_owner: "canonical"
+#    repo_name: "merge-proposal-poc"
+#    demo_url: "launchpad.demos.haus"
+#
+#  - repo_owner: "canonical"
+#    repo_name: "maas-site-manager"
+#    demo_url: "maas-site-manager.demos.haus"
