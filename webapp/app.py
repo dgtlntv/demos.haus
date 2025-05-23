@@ -39,23 +39,19 @@ app = FlaskBase(
 init_sso(app)
 
 
-def load_permanent_demos_config():
-    """Load the permanent demos configuration from YAML file"""
+def get_permanent_demo_config(repo_owner, repo_name):
+    """Get permanent demo config for a specific repository"""
     try:
         with open("./permanent-demos.yaml", "r") as f:
             config = yaml.safe_load(f)
-            return config.get("permanent_demos", [])
+            permanent_demos = config.get("permanent_demos", [])
     except FileNotFoundError:
         app.logger.warning("permanent-demos.yaml not found")
-        return []
+        return None
     except yaml.YAMLError as e:
         app.logger.error(f"Error parsing permanent-demos.yaml: {e}")
-        return []
+        return None
 
-
-def get_permanent_demo_config(repo_owner, repo_name):
-    """Get permanent demo config for a specific repository"""
-    permanent_demos = load_permanent_demos_config()
     for demo in permanent_demos:
         if demo["repo_owner"] == repo_owner and demo["repo_name"] == repo_name:
             return demo
@@ -71,11 +67,6 @@ def get_jenkins_job(action):
     }[action]
 
 
-def get_jenkins_permanent_job():
-    """Get Jenkins job for permanent main branch demos"""
-    return "webteam/job/start-permanent-demo"
-
-
 def validate_github_webhook_signature(payload, signature):
     """
     Generate the payload signature and compare with the given one
@@ -89,14 +80,8 @@ def validate_github_webhook_signature(payload, signature):
     return hmac.compare_digest(digest, signature)
 
 
-@app.route("/")
-@login_required
-def index():
-    return flask.render_template("index.html")
-
-
-@app.route("/hook/gh", methods=["POST"])
-def github_demo_webhook():
+def handle_webhook_auth_and_ping():
+    """Common webhook authentication and ping handling"""
     if not validate_github_webhook_signature(
         flask.request.data, flask.request.headers.get("X-Hub-Signature")
     ):
@@ -106,52 +91,12 @@ def github_demo_webhook():
     if flask.request.headers.get("X-GitHub-Event") == "ping":
         return flask.jsonify({"message": "Hi Github!"}, 200)
 
-    payload = flask.request.json
-    action = payload["action"]
-    pull_request = payload["number"]
-    pull_request_url = payload["pull_request"]["html_url"]
-    repo_owner = payload["repository"]["owner"]["login"]
-    repo_name = payload["repository"]["name"]
-    author = payload["sender"]["login"]
+    return None
 
-    issue = ghub.issue(repo_owner, repo_name, pull_request)
-    repo = ghub.repository(repo_owner, repo_name)
 
-    # Only trigger builds if PR author is a collaborator
-    allowed_bots = ["renovate[bot]", "dependabot[bot]", "github-actions[bot]"]
-    allowed = author in allowed_bots or repo.is_collaborator(author)
-
-    if not allowed:
-        message = f"{author} is not a collaborator of the repo"
-
-        # If the PR was opened post the error message
-        if action == "opened":
-            issue.create_comment(message)
-
-        return flask.jsonify({"message": message}, 403)
-
-    # Check if the db should be deleted
-    keepdb = "false"
-    for label in payload["pull_request"]["labels"]:
-        if label["name"] == "keepdb":
-            keepdb = "true"
-            break
-
-    # Work out the remote build url
-    try:
-        jenkins_job = get_jenkins_job(action)
-    except KeyError:
-        return (
-            flask.jsonify({"message": f"No job for PR action: {action}"}),
-            200,
-        )
-
-    jenkins_job_params = (
-        f"token={JENKINS_TOKEN}&PR_URL={pull_request_url}&KEEP_DB={keepdb}"
-    )
-    remote_build_url = (
-        f"http://{JENKINS_URL}/{jenkins_job}/buildWithParameters?{jenkins_job_params}"
-    )
+def trigger_jenkins_job(jenkins_job, jenkins_job_params):
+    """Common Jenkins job triggering logic"""
+    remote_build_url = f"http://{JENKINS_URL}/{jenkins_job}/buildWithParameters?{jenkins_job_params}"
     job_id = ""
 
     # Trigger the build in jenkins
@@ -165,9 +110,93 @@ def github_demo_webhook():
         app.logger.info(remote_build_url)
         app.logger.info(job_id)
 
+    return job_id
+
+
+def extract_payload_info(payload):
+    """Extract all relevant information from GitHub webhook payload"""
+    return {
+        # Common fields
+        "repo_owner": payload.get("repository", {})
+        .get("owner", {})
+        .get("login", ""),
+        "repo_name": payload.get("repository", {}).get("name", ""),
+        "repo_url": payload.get("repository", {}).get("html_url", ""),
+        # PR webhook specific fields
+        "action": payload.get("action", ""),
+        "pull_request": payload.get("number", ""),
+        "pull_request_url": payload.get("pull_request", {}).get(
+            "html_url", ""
+        ),
+        "author": payload.get("sender", {}).get("login", ""),
+        "labels": payload.get("pull_request", {}).get("labels", []),
+        # Push webhook specific fields
+        "ref": payload.get("ref", ""),
+    }
+
+
+@app.route("/")
+@login_required
+def index():
+    return flask.render_template("index.html")
+
+
+@app.route("/hook/gh", methods=["POST"])
+def github_demo_webhook():
+    # Handle common authentication and ping
+    auth_response = handle_webhook_auth_and_ping()
+    if auth_response:
+        return auth_response
+
+    payload = flask.request.json
+    info = extract_payload_info(payload)
+
+    issue = ghub.issue(
+        info["repo_owner"], info["repo_name"], info["pull_request"]
+    )
+    repo = ghub.repository(info["repo_owner"], info["repo_name"])
+
+    # Only trigger builds if PR author is a collaborator
+    allowed_bots = ["renovate[bot]", "dependabot[bot]", "github-actions[bot]"]
+    allowed = info["author"] in allowed_bots or repo.is_collaborator(
+        info["author"]
+    )
+
+    if not allowed:
+        message = f"{info['author']} is not a collaborator of the repo"
+
+        # If the PR was opened post the error message
+        if info["action"] == "opened":
+            issue.create_comment(message)
+
+        return flask.jsonify({"message": message}, 403)
+
+    # Check if the db should be deleted
+    keepdb = "false"
+    for label in info["labels"]:
+        if label["name"] == "keepdb":
+            keepdb = "true"
+            break
+
+    # Work out the remote build url
+    try:
+        jenkins_job = get_jenkins_job(info["action"])
+    except KeyError:
+        return (
+            flask.jsonify(
+                {"message": f"No job for PR action: {info['action']}"}
+            ),
+            200,
+        )
+
+    jenkins_job_params = f"token={JENKINS_TOKEN}&PR_URL={info['pull_request_url']}&KEEP_DB={keepdb}"
+
+    # Trigger the Jenkins job
+    job_id = trigger_jenkins_job(jenkins_job, jenkins_job_params)
+
     # If the PR was opened post the the link to the demo
-    if action == "opened":
-        demo_url = f"https://{repo_name.replace('.', '-')}-{pull_request}.demos.haus"
+    if info["action"] == "opened":
+        demo_url = f"https://{info['repo_name'].replace('.', '-')}-{info['pull_request']}.demos.haus"
         jenkins_url = f"{JENKINS_PUBLIC_URL}/{jenkins_job}/{job_id}"
 
         comment = f"### [<img src='https://assets.ubuntu.com/v1/6baef514-ubuntu-circle-of-friends-large.svg' height=32 width=32> Demo</img>]({demo_url})\n"
@@ -182,67 +211,51 @@ def github_demo_webhook():
 @app.route("/hook/gh/permanent", methods=["POST"])
 def github_permanent_demo_webhook():
     """Handle webhook for permanent main branch demos"""
-    if not validate_github_webhook_signature(
-        flask.request.data, flask.request.headers.get("X-Hub-Signature")
-    ):
-        return flask.jsonify({"message": "Invalid secret"}, 403)
-
-    # Say hi to github when we do the initial setup.
-    if flask.request.headers.get("X-GitHub-Event") == "ping":
-        return flask.jsonify({"message": "Hi Github!"}, 200)
+    # Handle common authentication and ping
+    auth_response = handle_webhook_auth_and_ping()
+    if auth_response:
+        return auth_response
 
     # Only handle push events to main branch
     if flask.request.headers.get("X-GitHub-Event") != "push":
         return flask.jsonify({"message": "Only push events supported"}, 200)
 
     payload = flask.request.json
+    info = extract_payload_info(payload)
 
     # Check if this is a push to main branch
-    ref = payload.get("ref", "")
-    if ref not in ["refs/heads/main", "refs/heads/master"]:
+    if info["ref"] not in ["refs/heads/main", "refs/heads/master"]:
         return flask.jsonify(
             {"message": "Only main/master branch pushes supported"}, 200
         )
 
-    repo_owner = payload["repository"]["owner"]["login"]
-    repo_name = payload["repository"]["name"]
-    repo_url = payload["repository"]["html_url"]
-
     # Check if this repository has a permanent demo configured
-    demo_config = get_permanent_demo_config(repo_owner, repo_name)
+    demo_config = get_permanent_demo_config(
+        info["repo_owner"], info["repo_name"]
+    )
     if not demo_config:
         return flask.jsonify(
-            {"message": f"No permanent demo configured for {repo_owner}/{repo_name}"},
+            {
+                "message": f"No permanent demo configured for {info['repo_owner']}/{info['repo_name']}"
+            },
             200,
         )
 
     # Get the Jenkins job for permanent demos
-    jenkins_job = get_jenkins_permanent_job()
+    jenkins_job = "webteam/job/start-permanent-demo"
 
     # Parameters for the permanent demo job
     jenkins_job_params = (
-        f"token={JENKINS_TOKEN}&REPO_URL={repo_url}&REPO_OWNER={repo_owner}&"
-        f"REPO_NAME={repo_name}&DEMO_URL={demo_config['demo_url']}"
+        f"token={JENKINS_TOKEN}&REPO_URL={info['repo_url']}&REPO_OWNER={info['repo_owner']}&"
+        f"REPO_NAME={info['repo_name']}&DEMO_URL={demo_config['demo_url']}"
     )
-    remote_build_url = (
-        f"http://{JENKINS_URL}/{jenkins_job}/buildWithParameters?{jenkins_job_params}"
-    )
-    job_id = ""
 
-    # Trigger the build in jenkins
-    if not app.debug:
-        response = requests.get(remote_build_url)
-        response.raise_for_status()
-        # Get the id of the demo
-        job_id = response.headers.get("Location").split("/")[-2]
-    else:
-        # In debug mode just print the URL
-        app.logger.info(f"Permanent demo build URL: {remote_build_url}")
-        app.logger.info(f"Job ID: {job_id}")
+    # Trigger the Jenkins job
+    job_id = trigger_jenkins_job(jenkins_job, jenkins_job_params)
 
     return flask.jsonify(
         {
-            "message": f"Permanent demo deployment triggered for {repo_owner}/{repo_name}",
+            "message": f"Permanent demo deployment triggered for {info['repo_owner']}/{info['repo_name']}",
             "demo_url": f"https://{demo_config['demo_url']}",
             "jenkins_job_id": job_id,
         },
